@@ -257,7 +257,8 @@ fn extract_symbols(
         Language::JavaScript => extract_js_symbols(tree, source, &mut symbols)?,
         Language::TypeScript => extract_ts_symbols(tree, source, &mut symbols)?,
         Language::Go => extract_go_symbols(tree, source, &mut symbols)?,
-        Language::Html | Language::Css | Language::Swift | Language::CSharp | Language::Java => {
+        Language::Html | Language::Css | Language::Swift | Language::CSharp | Language::Java
+        | Language::Kotlin => {
             // These languages don't have structural-diff extraction implemented yet.
             // Return empty - structural diff not applicable.
             log::debug!("Structural diff not applicable for {:?}", language);

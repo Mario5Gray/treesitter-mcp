@@ -182,6 +182,7 @@ pub fn extract_enhanced_shape(
         Language::CSharp => extract_csharp_enhanced(tree, source, include_code)?,
         Language::Java => extract_java_enhanced(tree, source, include_code)?,
         Language::Go => extract_go_enhanced(tree, source, include_code)?,
+        Language::Kotlin => extract_kotlin_enhanced(tree, source, include_code)?,
         Language::Html | Language::Css => {
             // HTML and CSS are markup/styling languages and are not suitable for
             // structural shape analysis. They lack the function/class/module structure
@@ -1546,6 +1547,307 @@ fn extract_go_enhanced(
     })
 }
 
+/// Extract enhanced shape from Kotlin source code
+fn extract_kotlin_enhanced(
+    tree: &Tree,
+    source: &str,
+    include_code: bool,
+) -> Result<EnhancedFileShape, io::Error> {
+    let mut functions = Vec::new();
+    let mut classes = Vec::new();
+    let mut imports = Vec::new();
+    let ts_language = tree_sitter_kotlin::LANGUAGE.into();
+
+    let query_str = r#"
+        (function_declaration) @func
+        (class_declaration) @class
+        (object_declaration) @object
+        (import_header) @import
+    "#;
+
+    let query = Query::new(&ts_language, query_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to create tree-sitter query: {e}"),
+        )
+    })?;
+
+    let mut cursor = QueryCursor::new();
+    let matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+    let mut processed_func_nodes = std::collections::HashSet::new();
+    let mut processed_class_nodes = std::collections::HashSet::new();
+
+    for match_ in matches {
+        for capture in match_.captures {
+            let node = capture.node;
+            let capture_name = query.capture_names()[capture.index as usize];
+
+            match capture_name {
+                "func" => {
+                    let node_id = node.id();
+                    if !processed_func_nodes.insert(node_id) {
+                        continue;
+                    }
+
+                    // In Kotlin grammar, function name is a simple_identifier child
+                    if let Some(name) = find_child_by_kind(node, "simple_identifier") {
+                        if let Ok(name_text) = name.utf8_text(source.as_bytes()) {
+                            let line = node.start_position().row + 1;
+                            let end_line = node.end_position().row + 1;
+                            let signature = extract_signature(node, source)?;
+                            let doc = extract_doc_comment(node, source, Language::Kotlin)?;
+                            let code = if include_code {
+                                extract_code(node, source)?
+                            } else {
+                                None
+                            };
+
+                            let annotations = extract_kotlin_annotations(node, source);
+
+                            functions.push(EnhancedFunctionInfo {
+                                name: name_text.to_string(),
+                                signature,
+                                line,
+                                end_line,
+                                doc,
+                                code,
+                                annotations,
+                            });
+                        }
+                    }
+                }
+                "class" => {
+                    let node_id = node.id();
+                    if !processed_class_nodes.insert(node_id) {
+                        continue;
+                    }
+
+                    // In Kotlin grammar, class name is a type_identifier child
+                    if let Some(name_node) = find_child_by_kind(node, "type_identifier") {
+                        if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                            let line = node.start_position().row + 1;
+                            let end_line = node.end_position().row + 1;
+                            let doc = extract_doc_comment(node, source, Language::Kotlin)?;
+                            let code = if include_code {
+                                extract_code(node, source)?
+                            } else {
+                                None
+                            };
+
+                            let implements = extract_kotlin_supertypes(node, source);
+                            let methods =
+                                extract_kotlin_class_methods(node, source, include_code)?;
+                            let properties = extract_kotlin_class_properties(node, source);
+
+                            classes.push(EnhancedClassInfo {
+                                name: name.to_string(),
+                                line,
+                                end_line,
+                                doc,
+                                code,
+                                methods,
+                                implements,
+                                properties,
+                                fields: vec![],
+                            });
+                        }
+                    }
+                }
+                "object" => {
+                    // Kotlin objects are singleton classes
+                    let node_id = node.id();
+                    if !processed_class_nodes.insert(node_id) {
+                        continue;
+                    }
+
+                    if let Some(name_node) = find_child_by_kind(node, "type_identifier") {
+                        if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                            let line = node.start_position().row + 1;
+                            let end_line = node.end_position().row + 1;
+                            let doc = extract_doc_comment(node, source, Language::Kotlin)?;
+                            let code = if include_code {
+                                extract_code(node, source)?
+                            } else {
+                                None
+                            };
+
+                            let implements = extract_kotlin_supertypes(node, source);
+                            let methods =
+                                extract_kotlin_class_methods(node, source, include_code)?;
+
+                            classes.push(EnhancedClassInfo {
+                                name: name.to_string(),
+                                line,
+                                end_line,
+                                doc,
+                                code,
+                                methods,
+                                implements,
+                                properties: vec![],
+                                fields: vec![],
+                            });
+                        }
+                    }
+                }
+                "import" => {
+                    if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                        imports.push(ImportInfo {
+                            text: text.to_string(),
+                            line: node.start_position().row + 1,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(EnhancedFileShape {
+        path: None,
+        language: None,
+        functions,
+        structs: vec![],
+        classes,
+        imports,
+        impl_blocks: vec![],
+        traits: vec![],
+        interfaces: vec![],
+        properties: vec![],
+        dependencies: vec![],
+    })
+}
+
+/// Find the first child node with a given kind
+fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+    }
+    None
+}
+
+/// Extract methods from a Kotlin class or object body
+fn extract_kotlin_class_methods(
+    class_node: Node,
+    source: &str,
+    include_code: bool,
+) -> Result<Vec<EnhancedFunctionInfo>, io::Error> {
+    let mut methods = Vec::new();
+
+    if let Some(body) = find_child_by_kind(class_node, "class_body") {
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            if child.kind() == "function_declaration" {
+                if let Some(name_node) = find_child_by_kind(child, "simple_identifier") {
+                    if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                        let line = child.start_position().row + 1;
+                        let end_line = child.end_position().row + 1;
+                        let signature = extract_signature(child, source)?;
+                        let doc = extract_doc_comment(child, source, Language::Kotlin)?;
+                        let code = if include_code {
+                            extract_code(child, source)?
+                        } else {
+                            None
+                        };
+                        let annotations = extract_kotlin_annotations(child, source);
+
+                        methods.push(EnhancedFunctionInfo {
+                            name: name.to_string(),
+                            signature,
+                            line,
+                            end_line,
+                            doc,
+                            code,
+                            annotations,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(methods)
+}
+
+/// Extract properties from a Kotlin class body
+fn extract_kotlin_class_properties(class_node: Node, source: &str) -> Vec<PropertyInfo> {
+    let mut properties = Vec::new();
+
+    if let Some(body) = find_child_by_kind(class_node, "class_body") {
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            if child.kind() == "property_declaration" {
+                if let Some(name_node) = find_child_by_kind(child, "variable_declaration") {
+                    if let Some(id_node) = find_child_by_kind(name_node, "simple_identifier") {
+                        if let Ok(name) = id_node.utf8_text(source.as_bytes()) {
+                            let line = child.start_position().row + 1;
+                            let end_line = child.end_position().row + 1;
+
+                            properties.push(PropertyInfo {
+                                name: name.to_string(),
+                                line,
+                                end_line,
+                                property_type: None,
+                                doc: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    properties
+}
+
+/// Extract supertypes (implements/extends) from a Kotlin class
+fn extract_kotlin_supertypes(class_node: Node, source: &str) -> Vec<String> {
+    let mut supertypes = Vec::new();
+
+    let mut cursor = class_node.walk();
+    for child in class_node.children(&mut cursor) {
+        if child.kind() == "delegation_specifier" {
+            // delegation_specifier contains user_type or constructor_invocation
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                if inner.kind() == "user_type" || inner.kind() == "constructor_invocation" {
+                    if let Some(type_id) = find_child_by_kind(inner, "type_identifier") {
+                        if let Ok(name) = type_id.utf8_text(source.as_bytes()) {
+                            supertypes.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    supertypes
+}
+
+/// Extract annotations from a Kotlin node
+fn extract_kotlin_annotations(node: Node, source: &str) -> Vec<String> {
+    let mut annotations = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let mut mod_cursor = child.walk();
+            for mod_child in child.children(&mut mod_cursor) {
+                if mod_child.kind() == "annotation" {
+                    if let Ok(text) = mod_child.utf8_text(source.as_bytes()) {
+                        annotations.push(text.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    annotations
+}
+
 /// Helper function to extract methods from a Java class
 fn extract_java_class_methods(
     class_node: Node,
@@ -2099,6 +2401,7 @@ fn is_comment_node(node: &Node, language: Language) -> bool {
         | Language::CSharp
         | Language::Java
         | Language::Go => kind == "line_comment" || kind == "block_comment" || kind == "comment",
+        Language::Kotlin => kind == "line_comment" || kind == "multiline_comment",
         Language::Python => kind == "comment",
         _ => false,
     }
@@ -2127,7 +2430,8 @@ fn extract_doc_from_comment(comment_text: &str, language: Language) -> String {
                 String::new()
             }
         }
-        Language::JavaScript | Language::TypeScript | Language::Java | Language::Go => {
+        Language::JavaScript | Language::TypeScript | Language::Java | Language::Go
+        | Language::Kotlin => {
             // Handle /** */ and // comments
             if trimmed.starts_with("/**") && trimmed.ends_with("*/") {
                 trimmed
